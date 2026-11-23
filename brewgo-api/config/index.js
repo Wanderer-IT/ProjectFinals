@@ -1,8 +1,6 @@
-// All settings live here. Secrets come from process.env (never hard-coded in a repo).
 const fs = require("fs");
 const path = require("path");
 
-// Tiny .env reader (no extra package). Real environment variables always win.
 (function loadEnvFile() {
   const file = path.join(__dirname, "..", ".env");
   if (!fs.existsSync(file)) return;
