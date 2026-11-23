@@ -16,8 +16,8 @@ const mayaPublicKey = process.env.MAYA_PUBLIC_KEY || "";
 const mayaSecretKey = process.env.MAYA_SECRET_KEY || "";
 const port = Number(process.env.PORT) || 3000;
 const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-const supabaseUrl = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
-const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || "").trim();
+const supabaseUrl = (process.env.SUPABASE_URL || "https://rzmcmkhwxhprejgcraxs.supabase.co").trim().replace(/\/+$/, "");
+const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || "sb_publishable_JMhV5C4HarSErLNVYuyR0w_zs011EcR").trim();
 
 module.exports = {
   port,
