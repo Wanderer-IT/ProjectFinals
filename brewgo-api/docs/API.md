@@ -1,6 +1,6 @@
 # Brew Go API v1: contract
 
-Base URL: `http://localhost:3000/api/v1`  |  Auth: `Authorization: Bearer <token>`  |  Body: JSON
+Base URL: `[http://localhost:3000/api/v](https://brewgo-api-6dgv.onrender.com)`  |  Auth: `Authorization: Bearer <token>`  |  Body: JSON
 
 ## Response envelopes (finals project guide)
 
