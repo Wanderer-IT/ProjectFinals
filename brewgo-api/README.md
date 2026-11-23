@@ -10,7 +10,7 @@ using only the Express.js / REST / design-pattern material from the ITPE101 lect
 npm install
 cp .env.example .env     # turns on real Maya sandbox payments (see "Payments with Maya" below)
 npm start                # http://localhost:3000   (npm run dev = auto-restart with nodemon)
-npm test                 # 140+ checks: the API (mock gateway) + the Maya integration (fake Maya server)
+npm test                 # 170+ checks: the API (mock gateway), the Maya integration (fake Maya server), Supabase saving (fake Supabase)
 ```
 
 Demo logins (seeded): customer `maya.santos@email.com` / `Password123`, staff `admin@brewgo.ph` / `Admin123!`.
@@ -20,6 +20,23 @@ Settings are environment variables (see `.env.example`): `PORT`, `PUBLIC_API_URL
 Put your deployed React URL in `CORS_ORIGINS` and `FRONTEND_URL`, otherwise the browser blocks requests and the payment redirect goes to localhost.
 
 Full endpoint list: **docs/API.md**. Postman: import `postman/brewgo-api.postman_collection.json`, then run the folders in order.
+
+## Saving data in Supabase
+
+By default the API keeps everything in memory, so data resets on every restart. To keep it in your Supabase project:
+
+1. In Supabase open **SQL Editor**, paste `supabase/schema.sql` and press **Run** (creates one table, `brewgo_records`, with Row Level Security on).
+2. In Supabase open **Project Settings > API** and copy the **Project URL** and the **service_role** key (not the `anon` key).
+3. Put them in `.env` (local) and in Render's **Environment** tab (deployed):
+   ```
+   SUPABASE_URL=https://xxxxxxxx.supabase.co
+   SUPABASE_SERVICE_ROLE_KEY=eyJ...
+   ```
+4. Restart. The first boot seeds the demo data into Supabase; later boots load it back. `GET /api/v1/health` shows `"storage": {"storage": "supabase", ...}` when it works.
+
+How it works: the layered code (controllers > services > repositories) is unchanged and still works on an in-memory store. `models/persistence.js` loads that store from Supabase at startup, saves only the records that changed every 2 seconds (`SUPABASE_FLUSH_MS`), and saves once more when the server shuts down. If Supabase is unreachable at startup the API refuses to start (so it never runs with empty data by mistake); if it goes down later, the API keeps answering and retries.
+
+Good to know: run **one** API instance (two instances would overwrite each other's data). A crash can lose up to the last 2 seconds of changes. The catalog is seeded only once, so to re-seed it from `models/seedData.js`, empty the table (`truncate public.brewgo_records;`) and restart. Never commit or expose the service_role key.
 
 ## Where each lecture topic is used
 

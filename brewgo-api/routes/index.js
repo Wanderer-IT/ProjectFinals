@@ -11,13 +11,14 @@ const orders = require("../controllers/orderController");
 const payments = require("../controllers/paymentController");
 const extras = require("../controllers/rewardController");
 const { ok } = require("../utils/respond");
+const persistence = require("../models/persistence");
 
 const router = express.Router();
 const authLimiter = rateLimit("login");
 const publicLimiter = rateLimit("public", 60);
 const staff = [authenticate, requireRole("admin")];
 
-router.get("/health", (req, res) => ok(res, { status: "ok", service: "brewgo-api", version: "v1", time: new Date().toISOString() }));
+router.get("/health", (req, res) => ok(res, { status: "ok", service: "brewgo-api", version: "v1", time: new Date().toISOString(), storage: persistence.status() }));
 
 // --- Auth ---
 router.post("/auth/register", authLimiter, v.validateRegister, auth.register);

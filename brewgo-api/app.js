@@ -5,8 +5,10 @@ const cors = require("./middleware/cors");
 const { notFound, errorHandler } = require("./middleware/errorHandler");
 const routes = require("./routes");
 const { seedDemoData } = require("./models/seedDemo");
+const persistence = require("./models/persistence");
 
-seedDemoData();
+// Memory-only mode seeds right away. With Supabase, server.js loads the saved data first and seeds only if it is empty.
+if (!persistence.enabled) seedDemoData();
 
 const app = express();
 app.disable("x-powered-by");

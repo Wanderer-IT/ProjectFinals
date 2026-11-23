@@ -5,7 +5,6 @@ const { buildOptionGroups } = require("../services/optionTemplates");
 
 function seedCatalog() {
   const menu = [
-    // category, name, price, stock, bestSeller, plantBased, tags, description
     ["hot", "Spanish Latte", 120, 100, true, false, ["sweet", "creamy", "milk", "coffee", "hot"], "Espresso with steamed milk and sweetened condensed milk."],
     ["hot", "Caramel Macchiato", 130, 100, true, false, ["sweet", "caramel", "coffee", "hot", "creamy"], "Vanilla milk, espresso and a golden caramel drizzle."],
     ["hot", "Ube Cloud Brew", 140, 80, false, false, ["sweet", "ube", "creamy", "coffee", "hot"], "Purple yam cream floating over a smooth espresso."],
@@ -38,11 +37,9 @@ function seedCatalog() {
   ].forEach(([name, address, city, openTime, closeTime, phone]) =>
     branches.create({ name, address, city, openTime, closeTime, phone, acceptsDelivery: true }));
 
-  // Promo codes anyone can type into the coupon box.
   promoCoupons.create({ code: "BREWGO10", title: "10% off your order", type: "percent", value: 10, minSpend: 100, expiresAt: addDays(new Date(), 365).toISOString(), usedBy: [] });
   promoCoupons.create({ code: "SUMMER20", title: "Summer 20% off (expired)", type: "percent", value: 20, minSpend: 0, expiresAt: "2025-08-31T00:00:00.000Z", usedBy: [] }); // handy for testing COUPON_EXPIRED
 
-  // Reward catalog (redeem with points) - names/points from the Rewards + Checkout frames.
   [
     ["PHP 10 coupon", 10, 10, 0, null],
     ["PHP 20 coupon", 20, 25, 0, null],

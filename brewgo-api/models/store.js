@@ -14,4 +14,4 @@ function nextId(name, start = 1) {
   return counters[name]++;
 }
 
-module.exports = { db, nextId };
+module.exports = { db, nextId, counters };
