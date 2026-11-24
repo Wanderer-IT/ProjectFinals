@@ -16,8 +16,8 @@ const mayaPublicKey = process.env.MAYA_PUBLIC_KEY || "";
 const mayaSecretKey = process.env.MAYA_SECRET_KEY || "";
 const port = Number(process.env.PORT) || 3000;
 const frontendUrl = process.env.FRONTEND_URL || "http://localhost:5173";
-const supabaseUrl = (process.env.SUPABASE_URL || "https://rzmcmkhwxhprejgcraxs.supabase.co").trim().replace(/\/+$/, "");
-const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY || "sb_publishable_JMhV5C4HarSErLNVYuyR0w_zs011EcR").trim();
+const supabaseUrl = (process.env.SUPABASE_URL || "").trim().replace(/\/+$/, "");
+const supabaseKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || "").trim();
 
 module.exports = {
   port,
@@ -44,14 +44,9 @@ module.exports = {
     pendingExpiryMinutes: Number(process.env.PENDING_EXPIRY_MINUTES) || 65, // Maya checkout sessions last 1 hour
   },
 
-  // Supabase persistence. Needs BOTH values; without them the API keeps data in memory only (demo mode).
-  // Use the SERVICE ROLE key (server-side secret). Never put it in the React app.
   supabase: {
-    enabled: Boolean(supabaseUrl && supabaseKey) && process.env.PERSISTENCE !== "off",
     url: supabaseUrl,
     serviceKey: supabaseKey,
-    table: process.env.SUPABASE_TABLE || "brewgo_records",
-    flushMs: Number(process.env.SUPABASE_FLUSH_MS) || 2000,
     timeoutMs: 15000,
   },
 

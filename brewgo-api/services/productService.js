@@ -13,7 +13,8 @@ const SORTS = {
 const isAvailable = (p) => p.available && p.stock > 0;
 
 // Shape sent to the app. Exact stock is only shown to staff; customers get lowStock.
-function toView(p, user) {
+// favoriteIds = Set of product ids the user favorited (load it once with toViews, not once per product).
+function toView(p, user, favoriteIds) {
   const view = {
     id: p.id, name: p.name, description: p.description, category: p.category,
     price: p.price, currency: config.currency, imageUrl: p.imageUrl,
@@ -21,12 +22,17 @@ function toView(p, user) {
     isAvailable: isAvailable(p), lowStock: p.stock > 0 && p.stock <= 5,
     optionGroups: p.optionGroups,
   };
-  if (user) view.isFavorite = Boolean(favorites.find(user.id, p.id));
+  if (user) view.isFavorite = Boolean(favoriteIds && favoriteIds.has(p.id));
   if (user && user.role === "admin") view.stock = p.stock;
   return view;
 }
 
-exports.list = (query, paging, user) => {
+async function toViews(list, user) {
+  const favoriteIds = user ? new Set((await favorites.findByUser(user.id)).map((f) => f.productId)) : null;
+  return list.map((p) => toView(p, user, favoriteIds));
+}
+
+exports.list = async (query, paging, user) => {
   const sort = SORTS[query.sort] || SORTS.name;
   if (query.sort && !SORTS[query.sort]) {
     throw new UnprocessableError("Invalid sort option", "VALIDATION_ERROR", [{ field: "sort", message: `sort must be one of: ${Object.keys(SORTS).join(", ")}` }]);
@@ -34,40 +40,36 @@ exports.list = (query, paging, user) => {
   if (query.category && !["hot", "iced", "pastries"].includes(query.category)) {
     throw new UnprocessableError("Invalid category", "VALIDATION_ERROR", [{ field: "category", message: "category must be one of: hot, iced, pastries" }]);
   }
-  const found = products
-    .search({
-      category: query.category,
-      q: query.search,
-      bestSeller: query.bestSeller === undefined ? undefined : query.bestSeller === "true",
-      availableOnly: query.available === "true",
-    })
-    .sort(sort);
+  const found = (await products.search({
+    category: query.category,
+    q: query.search,
+    bestSeller: query.bestSeller === undefined ? undefined : query.bestSeller === "true",
+    availableOnly: query.available === "true",
+  })).sort(sort);
   const { items, meta } = paginate(found, paging);
-  return { items: items.map((p) => toView(p, user)), meta };
+  return { items: await toViews(items, user), meta };
 };
 
-exports.get = (id, user) => {
-  const product = products.findById(id);
-  if (!product) throw new NotFoundError("Product", "PRODUCT_NOT_FOUND");
-  return toView(product, user);
-};
+exports.get = async (id, user) => (await toViews([await exports.getRecord(id)], user))[0];
 
-exports.getRecord = (id) => {
-  const product = products.findById(id);
+exports.getRecord = async (id) => {
+  const product = await products.findById(id);
   if (!product) throw new NotFoundError("Product", "PRODUCT_NOT_FOUND");
   return product;
 };
 
-exports.categories = () =>
-  ["hot", "iced", "pastries"].map((key) => ({
+exports.categories = async () => {
+  const all = await products.findAll();
+  return ["hot", "iced", "pastries"].map((key) => ({
     key,
     label: { hot: "Hot", iced: "Iced", pastries: "Pastries" }[key],
-    productCount: products.findAll((p) => p.category === key).length,
+    productCount: all.filter((p) => p.category === key).length,
   }));
+};
 
 // ----- staff CRUD (PUT replaces, PATCH changes only what is sent) -----
-exports.create = (body) =>
-  toView(products.create({
+exports.create = async (body) =>
+  toView(await products.create({
     name: body.name, description: body.description || "", category: body.category, price: body.price,
     imageUrl: body.imageUrl || "/images/placeholder.svg", stock: body.stock,
     isBestSeller: body.isBestSeller || false, plantBased: body.plantBased || false,
@@ -76,9 +78,9 @@ exports.create = (body) =>
     createdAt: nowIso(),
   }), { role: "admin" });
 
-exports.replace = (id, body) => {
-  const p = exports.getRecord(id);
-  Object.assign(p, {
+exports.replace = async (id, body) => {
+  await exports.getRecord(id);
+  const p = await products.update(id, {
     name: body.name, description: body.description || "", category: body.category, price: body.price,
     imageUrl: body.imageUrl || "/images/placeholder.svg", stock: body.stock,
     isBestSeller: body.isBestSeller || false, plantBased: body.plantBased || false,
@@ -88,21 +90,26 @@ exports.replace = (id, body) => {
   return toView(p, { role: "admin" });
 };
 
-exports.patch = (id, body) => {
-  const p = exports.getRecord(id);
+exports.patch = async (id, body) => {
+  const current = await exports.getRecord(id);
   const fields = ["name", "description", "category", "price", "imageUrl", "stock", "isBestSeller", "plantBased", "available", "tags"];
-  fields.forEach((f) => { if (body[f] !== undefined) p[f] = body[f]; });
+  const changes = {};
+  fields.forEach((f) => { if (body[f] !== undefined) changes[f] = body[f]; });
   if (body.category !== undefined || body.plantBased !== undefined || body.name !== undefined) {
-    p.optionGroups = buildOptionGroups(p.category, { plantBased: p.plantBased, name: p.name });
+    const next = { ...current, ...changes };
+    changes.optionGroups = buildOptionGroups(next.category, { plantBased: next.plantBased, name: next.name });
   }
+  const p = (await products.update(id, changes)) || current;
   return toView(p, { role: "admin" });
 };
 
-exports.remove = (id) => {
-  exports.getRecord(id);
-  products.remove(id);
-  favorites.items.splice(0, favorites.items.length, ...favorites.items.filter((f) => f.productId !== Number(id)));
-  carts.items.forEach((c) => { c.items = c.items.filter((i) => i.productId !== Number(id)); });
+exports.remove = async (id) => {
+  await exports.getRecord(id);
+  const productId = Number(id);
+  await products.remove(productId);
+  await favorites.removeWhere({ productId });
+  const affected = (await carts.findAll()).filter((c) => c.items.some((i) => i.productId === productId));
+  await Promise.all(affected.map((c) => carts.update(c.id, { items: c.items.filter((i) => i.productId !== productId) })));
 };
 
 // Turns the customer's chosen options into a normalized choice + price. Missing groups fall back to the first choice.
@@ -132,3 +139,4 @@ exports.resolveOptions = (product, selected = {}) => {
 
 exports.isAvailable = isAvailable;
 exports.toView = toView;
+exports.toViews = toViews;

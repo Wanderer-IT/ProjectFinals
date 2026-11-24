@@ -3,22 +3,24 @@ const productService = require("./productService");
 const { nowIso } = require("../utils/helpers");
 const { NotFoundError } = require("../utils/errors");
 
-exports.list = (user) =>
-  favorites.findByUser(user.id)
-    .map((f) => products.findById(f.productId))
-    .filter(Boolean)
-    .map((p) => productService.toView(p, user));
-
-// Returns { created } so the controller can answer 201 (new) or 200 (already a favorite).
-exports.add = (user, productId) => {
-  const product = productService.getRecord(productId);
-  const existing = favorites.find(user.id, product.id);
-  if (!existing) favorites.create({ userId: user.id, productId: product.id, createdAt: nowIso() });
-  return { created: !existing, product: productService.toView(product, user) };
+exports.list = async (user) => {
+  const mine = await favorites.findByUser(user.id);
+  const found = await products.findByIds(mine.map((f) => f.productId));
+  const byId = new Map(found.map((p) => [p.id, p]));
+  const liked = mine.map((f) => byId.get(f.productId)).filter(Boolean);
+  return productService.toViews(liked, user);
 };
 
-exports.remove = (user, productId) => {
-  const existing = favorites.find(user.id, Number(productId));
+// Returns { created } so the controller can answer 201 (new) or 200 (already a favorite).
+exports.add = async (user, productId) => {
+  const product = await productService.getRecord(productId);
+  const existing = await favorites.find(user.id, product.id);
+  if (!existing) await favorites.create({ userId: user.id, productId: product.id, createdAt: nowIso() });
+  return { created: !existing, product: (await productService.toViews([product], user))[0] };
+};
+
+exports.remove = async (user, productId) => {
+  const existing = await favorites.find(user.id, Number(productId));
   if (!existing) throw new NotFoundError("Favorite", "FAVORITE_NOT_FOUND");
-  favorites.remove(existing.id);
+  await favorites.remove(existing.id);
 };

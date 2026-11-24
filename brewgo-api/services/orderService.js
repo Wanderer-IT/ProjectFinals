@@ -1,6 +1,7 @@
 const config = require("../config");
 const { orders, products } = require("../repositories");
-const { nextId } = require("../models/store");
+const { nextId } = require("../db/supabase");
+const { withLock } = require("../utils/mutex");
 const rewardService = require("./rewardService");
 const couponService = require("./couponService");
 const notificationService = require("./notificationService");
@@ -39,12 +40,12 @@ const TITLES = {
 
 exports.STATES = STATES;
 
-exports.create = ({ user, lines, pricing, coupon, fulfillment, branch, pickupTime, deliveryAddress, paymentMethod, note }) => {
-  const orderNumber = `BG-${nextId("orderNumber", 8921)}`;
+exports.create = async ({ user, lines, pricing, coupon, fulfillment, branch, pickupTime, deliveryAddress, paymentMethod, note }) => {
+  const orderNumber = `BG-${await nextId("orderNumber", 8921)}`;
   const isCash = paymentMethod === "cash";
   const status = isCash ? "preparing" : "pending_payment"; // cash is paid at the counter
   const now = nowIso();
-  const order = orders.create({
+  return orders.create({
     orderNumber, userId: user.id, status,
     fulfillment, branchId: branch.id, branchName: branch.name,
     pickupTime: fulfillment === "pickup" ? pickupTime || "ASAP" : null,
@@ -62,52 +63,73 @@ exports.create = ({ user, lines, pricing, coupon, fulfillment, branch, pickupTim
     statusHistory: isCash ? [{ status: "pending_payment", at: now }, { status, at: now }] : [{ status, at: now }],
     createdAt: now, updatedAt: now,
   });
-  return order;
 };
 
-function applySideEffects(order, target, previous) {
-  if (target === "paid") {
-    order.payment.status = "paid";
-    rewardService.onOrderPaid(order);
-  }
-  if (target === "completed" && order.payment.method === "cash") {
-    order.payment.status = "paid"; // cash collected at the counter
-    rewardService.onOrderPaid(order);
+const putStockBack = (order) => Promise.all(order.items.map((i) => products.adjust(i.productId, "stock", i.quantity))); // skips deleted products (adjust finds no row)
+
+// What changes on the order's own payment block when it moves to `target` (no database calls).
+function paymentAfter(order, target, previous) {
+  const payment = { ...order.payment };
+  if (target === "paid" || (target === "completed" && payment.method === "cash")) payment.status = "paid"; // cash is collected at the counter
+  if (target === "cancelled") payment.status = previous === "pending_payment" ? "cancelled" : payment.method === "cash" ? "cancelled" : "refund_pending";
+  return payment;
+}
+
+async function runSideEffects(order, target) {
+  let pointsEarned;
+  if (target === "paid" || (target === "completed" && order.payment.method === "cash")) {
+    pointsEarned = await rewardService.onOrderPaid(order);
   }
   if (target === "cancelled") {
-    order.items.forEach((i) => { const p = products.findById(i.productId); if (p) p.stock += i.quantity; }); // put stock back
-    couponService.release(order.coupon, order.userId);
-    order.payment.status = previous === "pending_payment" ? "cancelled" : order.payment.method === "cash" ? "cancelled" : "refund_pending";
+    await putStockBack(order);
+    await couponService.release(order.coupon, order.userId);
   }
   if (TITLES[target]) {
     const [title, body] = TITLES[target];
-    notificationService.push(order.userId, "order", title, `${order.orderNumber}: ${body}`, { orderId: order.id, status: target });
+    await notificationService.push(order.userId, "order", title, `${order.orderNumber}: ${body}`, { orderId: order.id, status: target });
   }
+  return pointsEarned;
 }
 
-// CONTEXT of the state pattern: ask the current state if the move is allowed.
-exports.transition = (order, target) => {
+// CONTEXT of the state pattern: ask the current state if the move is allowed. (Callers must hold the order lock.)
+async function move(order, target) {
   const state = STATES[order.status];
   if (!state.canMoveTo(target)) {
     throw new ConflictError(`An order that is "${order.status}" cannot become "${target}"`, "ILLEGAL_ORDER_STATE", { from: order.status, to: target, allowed: state.next });
   }
   const previous = order.status;
-  order.status = target;
-  order.updatedAt = nowIso();
-  order.statusHistory.push({ status: target, at: order.updatedAt });
-  applySideEffects(order, target, previous);
-  return order;
-};
+  const updatedAt = nowIso();
+  const changes = {
+    status: target, updatedAt,
+    statusHistory: [...order.statusHistory, { status: target, at: updatedAt }],
+    payment: paymentAfter(order, target, previous),
+  };
+  // The new status is saved FIRST: if two requests race (webhook + return page), only one gets past the check above.
+  let saved = await orders.update(order.id, changes);
+  const pointsEarned = await runSideEffects({ ...order, ...changes }, target);
+  if (pointsEarned !== undefined) saved = await orders.update(order.id, { pointsEarned });
+  return saved;
+}
+
+// Runs fn with the freshest copy of the order while no one else changes it (webhook, return page, sweeper, staff, customer).
+exports.withOrder = (id, fn) =>
+  withLock(`order:${id}`, async () => {
+    const fresh = await orders.findById(id);
+    if (!fresh) throw new NotFoundError("Order", "ORDER_NOT_FOUND");
+    return fn(fresh);
+  });
+exports.moveLocked = move;
+exports.transition = (order, target) => exports.withOrder(order.id, (fresh) => move(fresh, target));
 
 // Used when the payment provider fails right after the order was created: undo everything quietly.
-exports.discard = (order) => {
-  order.items.forEach((i) => { const p = products.findById(i.productId); if (p) p.stock += i.quantity; });
-  couponService.release(order.coupon, order.userId);
-  orders.remove(order.id);
+exports.discard = async (order) => {
+  await putStockBack(order);
+  await couponService.release(order.coupon, order.userId);
+  await orders.remove(order.id);
 };
 
-exports.getRecordFor = (user, id) => {
-  const order = orders.findById(id);
+exports.getRecordFor = async (user, id) => {
+  const order = await orders.findById(id);
   if (!order || (order.userId !== user.id && user.role !== "admin")) throw new NotFoundError("Order", "ORDER_NOT_FOUND"); // no peeking at other people's orders
   return order;
 };
@@ -135,8 +157,10 @@ exports.toView = (order) => {
   };
 };
 
-exports.list = (user, { status }, paging) => {
-  const mine = user.role === "admin" ? orders.findAll() : orders.findByUser(user.id);
+const ORDER_STATUS_LIST = Object.keys(STATES);
+
+exports.list = async (user, { status }, paging) => {
+  const mine = user.role === "admin" ? await orders.findAll() : await orders.findByUser(user.id);
   const wanted = status === "active" ? ACTIVE : status === "past" ? PAST : ORDER_STATUS_LIST.includes(status) ? [status] : null;
   const filtered = mine.filter((o) => !wanted || wanted.includes(o.status)).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id - a.id);
   const { items, meta } = paginate(filtered, paging);
@@ -152,21 +176,23 @@ exports.list = (user, { status }, paging) => {
   };
   return { items: items.map(exports.toView), meta };
 };
-const ORDER_STATUS_LIST = Object.keys(STATES);
 
-exports.cancel = (user, id) => exports.toView(exports.transition(exports.getRecordFor(user, id), "cancelled"));
-
-// "Reorder in 1-Tap": copies the items into the cart; anything unavailable is reported back, not silently dropped.
-exports.reorder = (user, id) => {
-  const order = exports.getRecordFor(user, id);
-  const skipped = [];
-  order.items.forEach((item) => {
-    try {
-      cartService.addItem(user, { productId: item.productId, quantity: item.quantity, options: item.options, note: item.note || undefined });
-    } catch (err) {
-      skipped.push({ productId: item.productId, name: item.name, reason: err.code || "UNKNOWN" });
-    }
-  });
-  return { cart: cartService.getView(user), skipped };
+exports.cancel = async (user, id) => {
+  const order = await exports.getRecordFor(user, id);
+  return exports.toView(await exports.transition(order, "cancelled"));
 };
 
+// "Reorder in 1-Tap": copies the items into the cart; anything unavailable is reported back, not silently dropped.
+exports.reorder = async (user, id) => {
+  const order = await exports.getRecordFor(user, id);
+  const skipped = [];
+  for (const item of order.items) {
+    try {
+      await cartService.addItem(user, { productId: item.productId, quantity: item.quantity, options: item.options, note: item.note || undefined });
+    } catch (err) {
+      if (!err.status || err.status >= 500) throw err; // a real failure (e.g. database down) must not look like "item unavailable"
+      skipped.push({ productId: item.productId, name: item.name, reason: err.code || "UNKNOWN" });
+    }
+  }
+  return { cart: await cartService.getView(user), skipped };
+};

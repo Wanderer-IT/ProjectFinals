@@ -1,17 +1,18 @@
 const config = require("../config");
 const { paymentSessions, orders } = require("../repositories");
 const orderService = require("./orderService");
-const { nextId } = require("../models/store");
+const { nextId } = require("../db/supabase");
 const { NotFoundError, UnauthorizedError, ConflictError } = require("../utils/errors");
 
 // ---------------------------------------------------------------------------
 // The "external" payment gateway (stand-in for PayMongo / Maya sandbox).
 // It deliberately uses ITS OWN field names (snake_case, nested) like a real provider.
+// Its sessions are saved in the database too (collection "paymentSessions").
 // ---------------------------------------------------------------------------
 class MockGateway {
-  create_checkout_session({ amount_centavos, reference_number, payment_method_types }) {
-    const sessionId = `cs_${nextId("gatewaySession", 1000)}_${Math.random().toString(36).slice(2, 8)}`;
-    paymentSessions.create({ sessionId, amount: amount_centavos, reference: reference_number, methods: payment_method_types, status: "active" });
+  async create_checkout_session({ amount_centavos, reference_number, payment_method_types }) {
+    const sessionId = `cs_${await nextId("gatewaySession", 1000)}_${Math.random().toString(36).slice(2, 8)}`;
+    await paymentSessions.create({ sessionId, amount: amount_centavos, reference: reference_number, methods: payment_method_types, status: "active" });
     return {
       data: {
         id: sessionId,
@@ -22,15 +23,15 @@ class MockGateway {
       },
     };
   }
-  retrieve_checkout_session(sessionId) {
-    const s = paymentSessions.findOne((x) => x.sessionId === sessionId);
+  async retrieve_checkout_session(sessionId) {
+    const s = await paymentSessions.findOne({ sessionId });
     if (!s) return null;
     return { data: { id: s.sessionId, attributes: { status: s.status, amount: s.amount, reference_number: s.reference, payment_method_types: s.methods } } };
   }
   // What the customer does on the hosted page.
-  simulate_customer_action(sessionId, action) {
-    const s = paymentSessions.findOne((x) => x.sessionId === sessionId);
-    if (s && s.status === "active") s.status = action === "pay" ? "paid" : "cancelled";
+  async simulate_customer_action(sessionId, action) {
+    const s = await paymentSessions.findOne({ sessionId });
+    if (s && s.status === "active") return paymentSessions.update(s.id, { status: action === "pay" ? "paid" : "cancelled" });
     return s;
   }
 }
@@ -39,16 +40,16 @@ const gateway = new MockGateway();
 // ADAPTER PATTERN (lab + lecture): converts the gateway's format into the format our app uses.
 class GatewayAdapter {
   constructor(externalGateway) { this.gateway = externalGateway; }
-  createSession(order) {
-    const raw = this.gateway.create_checkout_session({
+  async createSession(order) {
+    const raw = await this.gateway.create_checkout_session({
       amount_centavos: Math.round(order.pricing.total * 100),
       reference_number: order.orderNumber,
       payment_method_types: order.payment.method === "card" ? ["card"] : ["gcash", "paymaya"],
     });
     return { sessionId: raw.data.id, checkoutUrl: raw.data.attributes.checkout_url, status: raw.data.attributes.status };
   }
-  getSession(sessionId) {
-    const raw = this.gateway.retrieve_checkout_session(sessionId);
+  async getSession(sessionId) {
+    const raw = await this.gateway.retrieve_checkout_session(sessionId);
     return raw ? { sessionId: raw.data.id, status: raw.data.attributes.status, amount: raw.data.attributes.amount / 100, reference: raw.data.attributes.reference_number } : null;
   }
 }
@@ -87,22 +88,26 @@ const PROVIDERS = { ewallet: new EWalletProvider(), card: new CardProvider(), ca
 exports.forMethod = (method) => new PaymentProcessor(PROVIDERS[method]);
 exports.providerName = () => config.payment.provider;
 
-// Applies what the PROVIDER says (not what the browser or webhook body says) to the order. Safe to run many times.
+// Applies what the PROVIDER says (not what the browser or webhook body says) to the order. Safe to run many times,
+// and safe when the webhook and the return page arrive at the same moment (one order lock, status re-checked inside it).
 async function applySession(order, session) {
   if (!session || order.status !== "pending_payment") return false;
-  if (session.status === "paid") {
-    if (session.amount !== undefined && Math.abs(session.amount - order.pricing.total) > 0.01) {
-      console.warn(`[payments] amount mismatch for ${order.orderNumber}: provider ${session.amount} vs order ${order.pricing.total}. Not marking as paid.`);
-      return false;
+  return orderService.withOrder(order.id, async (fresh) => {
+    if (fresh.status !== "pending_payment") return false;
+    if (session.status === "paid") {
+      if (session.amount !== undefined && Math.abs(session.amount - fresh.pricing.total) > 0.01) {
+        console.warn(`[payments] amount mismatch for ${fresh.orderNumber}: provider ${session.amount} vs order ${fresh.pricing.total}. Not marking as paid.`);
+        return false;
+      }
+      await orderService.moveLocked(fresh, "paid");
+      return true;
     }
-    orderService.transition(order, "paid");
-    return true;
-  }
-  if (session.status === "cancelled") {
-    orderService.transition(order, "cancelled");
-    return true;
-  }
-  return false; // still pending (or a failed attempt the customer can retry)
+    if (session.status === "cancelled") {
+      await orderService.moveLocked(fresh, "cancelled");
+      return true;
+    }
+    return false; // still pending (or a failed attempt the customer can retry)
+  });
 }
 
 exports.verifyWebhookSecret = (secret) => {
@@ -112,27 +117,28 @@ exports.verifyWebhookSecret = (secret) => {
 // Webhook received: look the order up, then ask the provider for the real status.
 exports.handleWebhook = async ({ sessionId, reference }) => {
   const baseNumber = reference && String(reference).match(/^BG-\d+/); // "BG-8922-a1b2c3" -> "BG-8922"
-  const order = (sessionId && orders.findBySession(sessionId)) || (baseNumber && orders.findByNumber(baseNumber[0]));
+  const order = (sessionId && (await orders.findBySession(sessionId))) || (baseNumber && (await orders.findByNumber(baseNumber[0])));
   if (!order || !order.payment.sessionId) return { applied: false, order: null };
   const applied = await applySession(order, await adapter.getSession(order.payment.sessionId));
-  return { applied, order };
+  return { applied, order: await orders.findById(order.id) };
 };
 
 // Backup for a missed webhook (and what the /payment/success page triggers): ask the provider, then sync the order.
+// Returns the up-to-date order.
 exports.reconcile = async (order) => {
   if (!order.payment.sessionId) throw new ConflictError("This order has no online payment to verify", "NO_PAYMENT_SESSION");
   await applySession(order, await adapter.getSession(order.payment.sessionId));
-  return order;
+  return orders.findById(order.id);
 };
 
 // Abandoned checkouts: after the session expires, release the stock. Check with the provider first, in case it was paid.
 exports.sweepStale = async (now = Date.now()) => {
   const limit = config.payment.pendingExpiryMinutes * 60000;
-  const stale = orders.findAll((o) => o.status === "pending_payment" && now - Date.parse(o.createdAt) > limit);
+  const stale = (await orders.findByStatus("pending_payment")).filter((o) => now - Date.parse(o.createdAt) > limit);
   for (const order of stale) {
     try {
-      await exports.reconcile(order);
-      if (order.status === "pending_payment") orderService.transition(order, "cancelled");
+      const current = await exports.reconcile(order);
+      if (current.status === "pending_payment") await orderService.transition(current, "cancelled");
     } catch (error) {
       console.error(`[payments] could not sweep ${order.orderNumber}: ${error.message}`);
     }
@@ -148,8 +154,8 @@ exports.getSandboxSession = async (sessionId) => {
 };
 exports.simulateCustomerAction = async (sessionId, action) => {
   await exports.getSandboxSession(sessionId);
-  gateway.simulate_customer_action(sessionId, action);
-  const order = orders.findBySession(sessionId);
+  await gateway.simulate_customer_action(sessionId, action);
+  const order = await orders.findBySession(sessionId);
   if (order) await applySession(order, await mockAdapter.getSession(sessionId));
   return { order };
 };

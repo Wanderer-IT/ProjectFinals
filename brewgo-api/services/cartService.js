@@ -1,20 +1,23 @@
 const config = require("../config");
 const { carts, products } = require("../repositories");
-const { nextId } = require("../models/store");
+const { nextId } = require("../db/supabase");
 const productService = require("./productService");
 const couponService = require("./couponService");
 const pricingService = require("./pricingService");
 const { nowIso } = require("../utils/helpers");
 const { NotFoundError, ConflictError } = require("../utils/errors");
 
-const touch = (cart) => { cart.updatedAt = nowIso(); };
+// Saves what changed in the cart (the cart row is the only thing written).
+const save = (cart, changes = {}) => carts.update(cart.id, { items: cart.items, couponCode: cart.couponCode, ...changes, updatedAt: nowIso() });
 
 // Joins cart rows with live product data. Prices ALWAYS come from the product list, never from the client.
-function buildLines(cart) {
+async function buildLines(cart) {
+  const found = await products.findByIds(cart.items.map((i) => i.productId));
+  const byId = new Map(found.map((p) => [p.id, p]));
+  cart.items = cart.items.filter((i) => byId.has(i.productId)); // drop products that were deleted
   const lines = [];
-  cart.items = cart.items.filter((i) => products.findById(i.productId)); // drop products that were deleted
   cart.items.forEach((item) => {
-    const product = products.findById(item.productId);
+    const product = byId.get(item.productId);
     const priced = productService.resolveOptions(product, item.options);
     const sameProductQty = cart.items.filter((i) => i.productId === item.productId).reduce((s, i) => s + i.quantity, 0);
     const issues = [];
@@ -30,21 +33,26 @@ function buildLines(cart) {
   return lines;
 }
 
-function view(user, fulfillment = "pickup") {
-  const cart = carts.getOrCreate(user.id);
-  const lines = buildLines(cart);
+async function view(user, fulfillment = "pickup") {
+  let cart = await carts.getOrCreate(user.id);
+  const itemCountBefore = cart.items.length;
+  const lines = await buildLines(cart);
+  let dirty = cart.items.length !== itemCountBefore;
   const subtotal = lines.reduce((s, l) => s + l.lineTotal, 0);
 
   let coupon = null;
   let couponWarning = null;
   if (cart.couponCode) {
     try {
-      coupon = couponService.resolve(cart.couponCode, user, subtotal);
+      coupon = await couponService.resolve(cart.couponCode, user, subtotal);
     } catch (err) {
+      if (err.status !== 422) throw err; // only "coupon not usable" is a warning; a database failure must fail the request
       couponWarning = { code: err.code, message: err.message }; // e.g. cart dropped below the minimum spend
       cart.couponCode = null;
+      dirty = true;
     }
   }
+  if (dirty) cart = (await save(cart)) || cart;
   const pricing = pricingService.quote(lines, fulfillment, coupon);
   return {
     items: lines,
@@ -69,67 +77,63 @@ function checkStock(cart, product, extraQty, excludeItemId) {
 }
 
 exports.getView = view;
-exports.buildLines = (cart) => buildLines(cart);
+exports.buildLines = buildLines;
 exports.getCart = (user) => carts.getOrCreate(user.id);
 
-exports.addItem = (user, body) => {
-  const cart = carts.getOrCreate(user.id);
-  const product = productService.getRecord(body.productId);
+exports.addItem = async (user, body) => {
+  const cart = await carts.getOrCreate(user.id);
+  const product = await productService.getRecord(body.productId);
   const quantity = body.quantity || 1;
   const { options } = productService.resolveOptions(product, body.options || {});
   checkStock(cart, product, quantity);
 
   const existing = cart.items.find((i) => i.productId === product.id && JSON.stringify(i.options) === JSON.stringify(options) && (i.note || "") === (body.note || ""));
   if (existing) existing.quantity += quantity;
-  else cart.items.push({ id: nextId("cartItem"), productId: product.id, quantity, options, note: body.note || "" });
-  touch(cart);
+  else cart.items.push({ id: await nextId("cartItem"), productId: product.id, quantity, options, note: body.note || "" });
+  await save(cart);
   return view(user);
 };
 
-exports.updateItem = (user, itemId, body) => {
-  const cart = carts.getOrCreate(user.id);
+exports.updateItem = async (user, itemId, body) => {
+  const cart = await carts.getOrCreate(user.id);
   const item = cart.items.find((i) => i.id === Number(itemId));
   if (!item) throw new NotFoundError("Cart item", "CART_ITEM_NOT_FOUND");
-  const product = productService.getRecord(item.productId);
+  const product = await productService.getRecord(item.productId);
   if (body.options !== undefined) item.options = productService.resolveOptions(product, body.options).options;
   if (body.quantity !== undefined) {
     checkStock(cart, product, body.quantity, item.id);
     item.quantity = body.quantity;
   }
   if (body.note !== undefined) item.note = body.note;
-  touch(cart);
+  await save(cart);
   return view(user);
 };
 
-exports.removeItem = (user, itemId) => {
-  const cart = carts.getOrCreate(user.id);
+exports.removeItem = async (user, itemId) => {
+  const cart = await carts.getOrCreate(user.id);
   const index = cart.items.findIndex((i) => i.id === Number(itemId));
   if (index === -1) throw new NotFoundError("Cart item", "CART_ITEM_NOT_FOUND");
   cart.items.splice(index, 1);
-  touch(cart);
+  await save(cart);
   return view(user);
 };
 
-exports.clear = (user) => {
-  const cart = carts.getOrCreate(user.id);
-  cart.items = [];
-  cart.couponCode = null;
-  touch(cart);
+exports.clear = async (user) => {
+  const cart = await carts.getOrCreate(user.id);
+  await save(cart, { items: [], couponCode: null });
 };
 
-exports.applyCoupon = (user, code) => {
-  const cart = carts.getOrCreate(user.id);
-  const subtotal = buildLines(cart).reduce((s, l) => s + l.lineTotal, 0);
-  const coupon = couponService.resolve(code, user, subtotal); // throws 422 COUPON_* when not usable
-  cart.couponCode = coupon.code;
-  touch(cart);
+exports.applyCoupon = async (user, code) => {
+  const cart = await carts.getOrCreate(user.id);
+  const subtotal = (await buildLines(cart)).reduce((s, l) => s + l.lineTotal, 0);
+  const coupon = await couponService.resolve(code, user, subtotal); // throws 422 COUPON_* when not usable
+  await save(cart, { couponCode: coupon.code });
   return view(user);
 };
 
-exports.removeCoupon = (user) => {
-  const cart = carts.getOrCreate(user.id);
-  cart.couponCode = null;
-  touch(cart);
+exports.removeCoupon = async (user) => {
+  const cart = await carts.getOrCreate(user.id);
+  await save(cart, { couponCode: null });
   return view(user);
 };
 

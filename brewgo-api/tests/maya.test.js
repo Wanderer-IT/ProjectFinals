@@ -4,6 +4,7 @@ process.env.FRONTEND_URL = "https://brewgo.example.app";
 process.env.WEBHOOK_SECRET = "test-webhook-secret";
 
 const http = require("http");
+const fakeSupabase = require("./helpers/fakeSupabase");
 
 const PK = "pk-test-public";
 const SK = "sk-test-secret";
@@ -69,8 +70,9 @@ const mayaPayment = (checkoutId, order, paymentStatus, amount = order.pricing.to
 
 async function main() {
   const app = require("../app");
-  const orders = require("../repositories").orders;
+  const { orders, products } = require("../repositories");
   const paymentService = require("../services/paymentService");
+  await require("../db/bootstrap").initDatabase(); // empty fake Supabase -> demo data
   const server = app.listen(0);
   base = `http://localhost:${server.address().port}`;
 
@@ -134,11 +136,11 @@ async function main() {
   const order3 = r.json.data.order;
   const chk3 = r.json.data.payment.checkoutUrl.split("id=")[1];
   fake.payments.set(chk3, mayaPayment(chk3, order3, "PAYMENT_EXPIRED"));
-  const stockMid = orders.findById(order3.id).items[0].quantity;
-  const productStockBefore = require("../repositories").products.findById(13).stock;
+  const stockMid = (await orders.findById(order3.id)).items[0].quantity;
+  const productStockBefore = (await products.findById(13)).stock;
   r = await call("POST", `/orders/${order3.id}/reconcile`, { token });
   check("PAYMENT_EXPIRED -> order cancelled", r.json.data.status === "cancelled" && r.json.data.payment.status === "cancelled");
-  check("stock released after expiry", require("../repositories").products.findById(13).stock === productStockBefore + stockMid);
+  check("stock released after expiry", (await products.findById(13)).stock === productStockBefore + stockMid);
 
   r = await placeOrder(token);
   const order4 = r.json.data.order;
@@ -149,28 +151,28 @@ async function main() {
 
   r = await placeOrder(token);
   const order5 = r.json.data.order;
-  orders.findById(order5.id).createdAt = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  await orders.update(order5.id, { createdAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString() });
   const swept = await paymentService.sweepStale();
-  check("sweeper cancels abandoned order older than the session", swept >= 1 && orders.findById(order5.id).status === "cancelled");
+  check("sweeper cancels abandoned order older than the session", swept >= 1 && (await orders.findById(order5.id)).status === "cancelled");
 
   r = await placeOrder(token);
   const order6 = r.json.data.order;
   const chk6 = r.json.data.payment.checkoutUrl.split("id=")[1];
   fake.payments.set(chk6, mayaPayment(chk6, order6, "PAYMENT_SUCCESS"));
-  orders.findById(order6.id).createdAt = new Date(Date.now() - 2 * 3600 * 1000).toISOString();
+  await orders.update(order6.id, { createdAt: new Date(Date.now() - 2 * 3600 * 1000).toISOString() });
   await paymentService.sweepStale();
-  check("sweeper does NOT cancel an order Maya says was paid (missed webhook)", orders.findById(order6.id).status === "paid");
+  check("sweeper does NOT cancel an order Maya says was paid (missed webhook)", (await orders.findById(order6.id)).status === "paid");
 
   console.log("\n== Maya is down ==");
   await call("DELETE", "/cart", { token });
   await call("POST", "/cart/items", { token, body: { productId: 13 } });
-  const stockBeforeOutage = require("../repositories").products.findById(13).stock;
-  const ordersBefore = orders.items.length;
+  const stockBeforeOutage = (await products.findById(13)).stock;
+  const ordersBefore = (await orders.findAll()).length;
   const key = nextKey();
   fake.failCreate = true;
   r = await call("POST", "/checkout", { token, body: { fulfillment: "pickup", paymentMethod: "card" }, headers: { "Idempotency-Key": key } });
   check("gateway 500 -> 503 PAYMENT_GATEWAY_ERROR", r.status === 503 && r.json.error.code === "PAYMENT_GATEWAY_ERROR");
-  check("no order left behind, stock untouched", orders.items.length === ordersBefore && require("../repositories").products.findById(13).stock === stockBeforeOutage);
+  check("no order left behind, stock untouched", (await orders.findAll()).length === ordersBefore && (await products.findById(13)).stock === stockBeforeOutage);
   check("cart is kept so the customer can retry", (await call("GET", "/cart", { token })).json.data.items.length === 1);
   fake.failCreate = false;
   r = await call("POST", "/checkout", { token, body: { fulfillment: "pickup", paymentMethod: "card" }, headers: { "Idempotency-Key": key } });
@@ -182,9 +184,15 @@ async function main() {
 
   server.close();
   fakeMaya.close();
+  await supabase.close();
 }
 
+let supabase;
+
 fakeMaya.listen(0, async () => {
+  supabase = await fakeSupabase.start();
+  process.env.SUPABASE_URL = supabase.url;
+  process.env.SUPABASE_SERVICE_ROLE_KEY = supabase.key;
   process.env.PAYMENT_PROVIDER = "maya";
   process.env.MAYA_PUBLIC_KEY = PK;
   process.env.MAYA_SECRET_KEY = SK;

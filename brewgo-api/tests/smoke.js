@@ -3,7 +3,8 @@ process.env.PAYMENT_PROVIDER = "mock"; // this file tests the built-in sandbox; 
 process.env.RATE_LIMIT_MAX = "1000";
 process.env.FRONTEND_URL = "http://localhost:5173";
 
-const app = require("../app");
+const fakeSupabase = require("./helpers/fakeSupabase");
+let app;
 let base;
 let passed = 0;
 const failures = [];
@@ -304,7 +305,15 @@ async function main() {
   check("token no longer works -> 401 TOKEN_INVALID", r.status === 401 && r.json.error.code === "TOKEN_INVALID");
 }
 
-const server = app.listen(0, async () => {
+(async () => {
+  // Supabase is the only database, so the tests talk to a fake Supabase server (no internet, no real project).
+  const supabase = await fakeSupabase.start();
+  process.env.SUPABASE_URL = supabase.url;
+  process.env.SUPABASE_SERVICE_ROLE_KEY = supabase.key;
+  app = require("../app");
+  await require("../db/bootstrap").initDatabase(); // empty database -> demo data
+
+  const server = app.listen(0);
   base = `http://localhost:${server.address().port}`;
   try {
     await main();
@@ -313,6 +322,8 @@ const server = app.listen(0, async () => {
     failures.push("crash");
   }
   server.close();
+  await supabase.close();
   console.log(`\n${passed} passed, ${failures.length} failed`);
   if (failures.length) { console.log("Failed:", failures.join(" | ")); process.exit(1); }
-});
+  process.exit(0);
+})();

@@ -44,9 +44,9 @@ const unavailable = () =>
     fallback: { endpoint: "/api/v1/products", queryParam: "search" },
   });
 
-exports.recommend = (query, user, { simulateOutage = false } = {}) => {
+exports.recommend = async (query, user, { simulateOutage = false } = {}) => {
   if (!config.aiEnabled || simulateOutage) throw unavailable(); // finals doc: 503 AI_UNAVAILABLE
-  const menu = products.findAll((p) => productService.isAvailable(p)).map((p) => ({ id: p.id, name: p.name, tags: p.tags }));
+  const menu = (await products.findAll()).filter((p) => productService.isAvailable(p)).map((p) => ({ id: p.id, name: p.name, tags: p.tags }));
   let result;
   try {
     result = ai.recommend(query, menu);
@@ -54,12 +54,13 @@ exports.recommend = (query, user, { simulateOutage = false } = {}) => {
     throw unavailable();
   }
   // GROUNDING: only real database products are returned - prices and stock come from our records, never from AI text.
-  const picked = result.productIds.map((id) => products.findById(id)).filter((p) => p && productService.isAvailable(p));
+  const picked = (await products.findByIds(result.productIds)).filter((p) => productService.isAvailable(p));
+  picked.sort((a, b) => result.productIds.indexOf(a.id) - result.productIds.indexOf(b.id)); // keep the AI's ranking
   return {
     label: "AI-Assisted",
     disclaimer: "Suggestions are AI-assisted. Prices and availability come from our menu.",
     // The summary is built by us; the customer's raw text is never echoed back.
     summary: picked.length ? `Here ${picked.length === 1 ? "is 1 pick" : `are ${picked.length} picks`} that match what you're craving.` : "I couldn't find a match. Try words like sweet, iced, strong, plant-based or pastry.",
-    products: picked.map((p) => productService.toView(p, user)),
+    products: await productService.toViews(picked, user),
   };
 };

@@ -8,41 +8,48 @@ using only the Express.js / REST / design-pattern material from the ITPE101 lect
 
 ```bash
 npm install
-cp .env.example .env     # turns on real Maya sandbox payments (see "Payments with Maya" below)
+cp .env.example .env     # then fill in SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY (see "Database: Supabase" below)
 npm start                # http://localhost:3000   (npm run dev = auto-restart with nodemon)
-npm test                 # 170+ checks: the API (mock gateway), the Maya integration (fake Maya server), Supabase saving (fake Supabase)
+npm test                 # 189 checks, no internet needed: the API, the Maya integration and the database layer (fake Maya + fake Supabase servers)
 ```
 
 Demo logins (seeded): customer `maya.santos@email.com` / `Password123`, staff `admin@brewgo.ph` / `Admin123!`.
 Maya starts with 120 pts, Gold tier, a live order `BG-8921`, 4 favorites and 2 saved payment methods, matching the Figma screens.
 
-Settings are environment variables (see `.env.example`): `PORT`, `PUBLIC_API_URL`, `FRONTEND_URL`, `CORS_ORIGINS`, `WEBHOOK_SECRET`, `AI_ENABLED`.
+Settings are environment variables (see `.env.example`): `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` (required), `PORT`, `PUBLIC_API_URL`, `FRONTEND_URL`, `CORS_ORIGINS`, `WEBHOOK_SECRET`, `AI_ENABLED`.
 Put your deployed React URL in `CORS_ORIGINS` and `FRONTEND_URL`, otherwise the browser blocks requests and the payment redirect goes to localhost.
 
 Full endpoint list: **docs/API.md**. Postman: import `postman/brewgo-api.postman_collection.json`, then run the folders in order.
 
-## Saving data in Supabase
+## Database: Supabase (the only database)
 
-By default the API keeps everything in memory, so data resets on every restart. To keep it in your Supabase project:
+All data lives in your Supabase project. The server keeps **no copy** in memory: every request reads and writes Supabase directly, so a restart, a crash or a redeploy never loses anything.
 
-1. In Supabase open **SQL Editor**, paste `supabase/schema.sql` and press **Run** (creates one table, `brewgo_records`, with Row Level Security on).
+1. In Supabase open **SQL Editor**, paste `supabase/schema.sql` and press **Run**. It creates the tables (`brewgo_records`, `brewgo_counters`), turns Row Level Security on, and installs three small helper functions. It is safe to run again, and it also upgrades a project created with the older version of this API (it carries the id counters over).
 2. In Supabase open **Project Settings > API** and copy the **Project URL** and the **service_role** key (not the `anon` key).
 3. Put them in `.env` (local) and in Render's **Environment** tab (deployed):
    ```
    SUPABASE_URL=https://xxxxxxxx.supabase.co
    SUPABASE_SERVICE_ROLE_KEY=eyJ...
    ```
-4. Restart. The first boot seeds the demo data into Supabase; later boots load it back. `GET /api/v1/health` shows `"storage": {"storage": "supabase", ...}` when it works.
+4. Start the API. On the very first start (empty database) the demo data is added. `GET /api/v1/health` shows `"database": {"database": "supabase", "reachable": true}` and answers `503` if Supabase is down.
 
-How it works: the layered code (controllers > services > repositories) is unchanged and still works on an in-memory store. `models/persistence.js` loads that store from Supabase at startup, saves only the records that changed every 2 seconds (`SUPABASE_FLUSH_MS`), and saves once more when the server shuts down. If Supabase is unreachable at startup the API refuses to start (so it never runs with empty data by mistake); if it goes down later, the API keeps answering and retries.
+If the two settings are missing, the schema is not installed, or Supabase cannot be reached, the API refuses to start and tells you what to fix.
 
-Good to know: run **one** API instance (two instances would overwrite each other's data). A crash can lose up to the last 2 seconds of changes. The catalog is seeded only once, so to re-seed it from `models/seedData.js`, empty the table (`truncate public.brewgo_records;`) and restart. Never commit or expose the service_role key.
+How it works (controllers > services > repositories > `db/supabase.js`):
+- `db/supabase.js` is the only file that talks to Supabase. Repositories (`repositories/`) are async and ask it for records; nothing is cached.
+- Each record is a JSON row in `brewgo_records(collection, id, data)`. You can browse and edit rows in the Supabase Table Editor (filter by `collection`).
+- Things that must never be done twice or overwritten are done **inside Postgres in one step**: handing out ids and order numbers, taking stock (it refuses to go below 0, so two customers can't both get the last croissant), adding/removing points, and changing only some fields of a record.
+- Requests that change the same thing at the same moment (one customer's cart/checkout, one order's payment) are put in line by a tiny in-process lock (`utils/mutex.js`). It holds no data. That is why a double-tapped checkout makes one order, and why the webhook and the return page can't award points twice.
+- If Supabase fails while a request is running, the customer gets `503 DATABASE_UNAVAILABLE` and the next request simply works once Supabase is back.
+
+Good to know: run **one** API instance (the lock is per process). The demo data is added only when the table is completely empty; to re-seed it, run `truncate public.brewgo_records; truncate public.brewgo_counters;` and restart. Never commit or expose the service_role key. The rate limiter (429) still counts in memory; that is only a short-lived counter, not data.
 
 ## Where each lecture topic is used
 
 | Lecture topic | Where |
 |---|---|
-| Routes, controllers, models (ch. 11) | `routes/`, `controllers/`, `repositories/` + `models/store.js` |
+| Routes, controllers, models (ch. 11) | `routes/`, `controllers/`, `repositories/` + Supabase (`db/supabase.js`) |
 | Layered design: Controller > Service > Repository | `services/`, `repositories/` |
 | CRUD + status codes 200/201/204/400/404/409/422/429/503 | `controllers/`, `middleware/errorHandler.js` |
 | Request validation middleware | `middleware/validate.js`, `middleware/validators.js` |
@@ -56,7 +63,7 @@ Good to know: run **one** API instance (two instances would overwrite each other
 | **State**: order lifecycle | `services/orderService.js` |
 | **Prototype**: product option templates | `services/optionTemplates.js` |
 | **Decorator**: request logging | `utils/decorators.js` |
-| **Singleton**: shared in-memory store | `models/store.js` |
+| **Singleton**: one shared database client and one instance of each repository (Node caches the module) | `db/supabase.js`, `repositories/index.js` |
 | Inheritance / abstract base class | `repositories/BaseRepository.js`, `utils/errors.js`, strategy + state classes |
 
 ## Payments with Maya (real sandbox)
@@ -87,7 +94,7 @@ Good to know:
 
 ## Good to know
 
-- **Data is in memory** (as in the lectures). Restarting resets everything to the seed data. Fine for the defense; use a database for real life.
+- **Data is in Supabase** (see "Database: Supabase"). Restarting the API keeps everything.
 - With `PAYMENT_PROVIDER=mock` the payment page is a local stand-in (`/api/v1/payments/sandbox/...`). The app flow is identical to Maya's: redirect to `checkoutUrl`, return to `/payment/success|cancelled`, read `GET /orders/:id`.
 - **The AI is a keyword-based stand-in** behind an adapter. It can only return real menu items; prices and stock always come from the database. To test the 503 fallback send header `X-Simulate-AI-Outage: true` (or start with `AI_ENABLED=false`).
 - Validation errors are **422** with `details[]` (finals guide), not 400. 400 is only for broken JSON / bad Idempotency-Key.

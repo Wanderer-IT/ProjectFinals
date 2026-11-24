@@ -9,15 +9,19 @@ const cart = require("../controllers/cartController");
 const orders = require("../controllers/orderController");
 const payments = require("../controllers/paymentController");
 const extras = require("../controllers/rewardController");
-const { ok } = require("../utils/respond");
-const persistence = require("../models/persistence");
+const ApiResponseBuilder = require("../utils/ApiResponseBuilder");
+const database = require("../db/supabase");
 
 const router = express.Router();
 const authLimiter = rateLimit("login");
 const publicLimiter = rateLimit("public", 60);
 const staff = [authenticate, requireRole("admin")];
 
-router.get("/health", (req, res) => ok(res, { status: "ok", service: "brewgo-api", version: "v1", time: new Date().toISOString(), storage: persistence.status() }));
+router.get("/health", async (req, res) => {
+  const db = await database.ping(); // a real round trip to Supabase, so /health tells the truth
+  const data = { status: db.reachable ? "ok" : "degraded", service: "brewgo-api", version: "v1", time: new Date().toISOString(), database: db };
+  new ApiResponseBuilder().status(db.reachable ? 200 : 503).success(data).send(res); // 503 when the database is down, so uptime monitors notice
+});
 
 // --- Auth ---
 router.post("/auth/register", authLimiter, v.validateRegister, auth.register);
