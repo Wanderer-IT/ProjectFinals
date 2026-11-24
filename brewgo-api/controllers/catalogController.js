@@ -1,3 +1,4 @@
+// Menu: home, branches, categories, products, favorites
 const productService = require("../services/productService");
 const favoriteService = require("../services/favoriteService");
 const homeFacade = require("../services/homeFacade");

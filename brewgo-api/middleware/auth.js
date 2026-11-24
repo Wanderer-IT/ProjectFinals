@@ -9,6 +9,8 @@ function readToken(req) {
   return scheme === "Bearer" && token ? token : null;
 }
 
+// Finds the session, then the user. For requests that CHANGE data (not GET) the customer's requests are put in line,
+// so two taps at the same moment (double "add to cart", double "checkout") are handled one after the other.
 async function loadUser(token, res, { lock }) {
   const session = await sessions.findByToken(token);
   if (!session) return { error: new UnauthorizedError("Invalid or expired token", "TOKEN_INVALID") };
