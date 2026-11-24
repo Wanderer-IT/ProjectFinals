@@ -1,4 +1,3 @@
-// ROUTES = the contract: URL + method -> middleware chain -> controller.
 const express = require("express");
 const { authenticate, optionalAuthenticate, requireRole } = require("../middleware/auth");
 const rateLimit = require("../middleware/rateLimit");
